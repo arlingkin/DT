@@ -679,11 +679,19 @@ function cleanupPivotCache(todayStr){
   // selama sesi browser terbuka lama. Hapus entry yang bukan tanggal hari ini.
   for(const key of pivotCache.keys()){ if(!key.endsWith('_'+todayStr)) pivotCache.delete(key); }
 }
-async function fetchPrevDay(symbol){
+async function fetchPrevDay(symbol, dailyCandles=null){
   const todayStr = new Date().toISOString().slice(0,10);
   cleanupPivotCache(todayStr);
   const cacheKey = symbol + '_' + todayStr;
   if(pivotCache.has(cacheKey)) return pivotCache.get(cacheKey);
+  // Kalau candle harian sudah tersedia dari fetch utama scan() (interval='1day'),
+  // pakai itu langsung -- 0 API call tambahan, bukan minta ulang ke upstream.
+  if(dailyCandles && dailyCandles.length>=2){
+    const c=dailyCandles[dailyCandles.length-2];
+    const result={ high:c.high, low:c.low, close:c.close };
+    pivotCache.set(cacheKey, result);
+    return result;
+  }
   const json=await tdRequest('time_series', { symbol, interval:'1day', outputsize:2 });
   if(json.status==='error' || !json.values) throw new Error('Gagal ambil data harian untuk pivot.');
   const rows=json.values.slice().reverse();
@@ -1447,7 +1455,8 @@ async function scan(){
     document.getElementById('pivotArea').innerHTML=`
       <div class="cell"><div class="k">Trend (ADX14)</div><div class="v" style="font-size:15px;">${trendAdx.toFixed(1)}</div><div class="meta" style="margin-top:2px;">${trendLabel(trendAdx)}</div></div>`;
     try{
-      const prevDay=await fetchPrevDay(symbol);
+      // interval='1day' -> candles utama sudah daily, langsung reuse (0 API call tambahan)
+      const prevDay=await fetchPrevDay(symbol, interval==='1day' ? candles : null);
       const piv=calcPivots(prevDay, symbol);
       const chgPct=(((sig.entry-(+prevDay.close))/(+prevDay.close))*100).toFixed(2);
       document.getElementById('pivotArea').innerHTML+=`
