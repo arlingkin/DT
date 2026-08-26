@@ -789,15 +789,16 @@ const FH_FOREX_SYMBOL={
 };
 const FH_RESOLUTION={'1min':'1','5min':'5','15min':'15','1h':'60','4h':'60','1day':'D'};
 const FH_RES_SECONDS={'1':60,'5':300,'15':900,'60':3600,'D':86400};
-/* Finnhub tidak punya resolution 4h asli -> ambil candle H1 lalu digabung per 4 jam
-   (bucket UTC 00/04/08/12/16/20) supaya OHLC-nya tetap benar (bukan sekadar sampling). */
-function resampleH1toH4(candles){
+/* Resample generik ke timeframe berapapun (bucket floor epoch UTC -> aman dipakai
+   utk 15min/1h/4h/1day sekaligus karena semuanya habis bagi 1 hari). Dipakai utk
+   1) Finnhub 4h (tidak native, dari H1) dan 2) turunan HTF bias dari candle utama
+   (lihat computeHTFBias) -> 1 fetch candle bisa dipakai buat 2 keperluan sekaligus. */
+function resampleCandles(candles, targetMinutes){
+  const bucketMs=targetMinutes*60000;
   const groups=new Map();
   for(const c of candles){
     const t=typeof c.time==='number' ? c.time*1000 : Date.parse(c.time);
-    const d=new Date(t);
-    const bucketHour=Math.floor(d.getUTCHours()/4)*4;
-    const key=Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), bucketHour);
+    const key=Math.floor(t/bucketMs)*bucketMs;
     if(!groups.has(key)) groups.set(key, []);
     groups.get(key).push(c);
   }
@@ -812,7 +813,8 @@ async function fetchCandlesFinnhub(symbol, interval, opts={}){
   if(!fhSym) throw new Error('Simbol ini belum dipetakan ke Finnhub.');
   const resolution=FH_RESOLUTION[interval] || '15';
   const secPerBar=FH_RES_SECONDS[resolution];
-  const barsNeeded = interval==='4h' ? 100*4 : 100; // 4h butuh 4x bar H1 mentah sblm di-resample
+  const minBars=opts.minBars || 100; // caller bisa minta lebih banyak (mis. utk resample HTF)
+  const barsNeeded = interval==='4h' ? minBars*4 : minBars; // 4h butuh 4x bar H1 mentah sblm di-resample
   // 'to' dibucket ke kelipatan TTL candle biar request yg masih dalam window TTL sama
   // persis parameternya -> kena cache server-side proxy.js (bukan selalu upstream baru).
   const bucketSec=Math.max(60, secPerBar);
@@ -823,14 +825,18 @@ async function fetchCandlesFinnhub(symbol, interval, opts={}){
     throw new Error(json.error || 'Data candle Finnhub kosong (kemungkinan endpoint ini butuh plan berbayar).');
   }
   const raw=json.t.map((t,i)=>({ time:t, open:json.o[i], high:json.h[i], low:json.l[i], close:json.c[i] }));
-  return (interval==='4h' ? resampleH1toH4(raw) : raw).slice(-100);
+  return (interval==='4h' ? resampleCandles(raw, 240) : raw).slice(-minBars);
 }
+/* opts.minBars: jumlah candle `interval` yang diminta (default 100). Dipakai scan()
+   utk minta lebih banyak candle base-timeframe saat HTF butuh resample dari situ -->
+   1 fetch candle mengcover sinyal utama + bias HTF, bukan 2 API call terpisah. */
 async function fetchCandles(symbol, interval, opts={}){
   try{
     return await fetchCandlesFinnhub(symbol, interval, opts);
   }catch(fhErr){
     if(fhErr.name==='AbortError') throw fhErr; // dibatalkan sengaja (ganti pair) -> jangan fallback
-    const json=await tdRequest('time_series', { symbol, interval, outputsize:100 }, opts);
+    const outputsize=opts.minBars || 100;
+    const json=await tdRequest('time_series', { symbol, interval, outputsize }, opts);
     if(json.status==='error' || !json.values) throw new Error(json.message || fhErr.message || 'Gagal mengambil data. Cek API key / limit request.');
     return json.values.slice().reverse().map(v=>({
       time:v.datetime, open:+v.open, high:+v.high, low:+v.low, close:+v.close
@@ -1295,18 +1301,29 @@ function renderFundamentals(m){
 
 /* ============ Multi-timeframe confluence ============
    Filter arah pakai trend EMA9/21 + ADX di timeframe lebih besar (HTF).
-   Cukup 1 fetch tambahan per scan, tetap kena cache server-side proxy.js
-   (TTL per interval) jadi aman kuota walau dipakai auto-scan terus. */
+   Dulu: fetch candle KEDUA (network call terpisah ke HTF interval) tiap scan.
+   Sekarang: HTF diturunkan lewat resample dari candle base-interval yang SAMA
+   (fetchCandles dipanggil dgn minBars lebih besar via htfExtraBars()) -> 0 API
+   call tambahan, cuma 1 request yang datanya dipakai buat 2 keperluan. */
+const BASE_MINUTES={'1min':1,'5min':5,'15min':15,'1h':60,'4h':240,'1day':1440};
 const HTF_MAP={'1min':'15min','5min':'1h','15min':'1h','1h':'4h','4h':'1day','1day':'1day'};
-async function fetchHTFBias(symbol, baseInterval, opts={}){
-  const htf=HTF_MAP[baseInterval] || '1h';
-  if(htf===baseInterval) return null;
-  const candles=await fetchCandles(symbol, htf, opts);
-  const closes=candles.map(c=>c.close);
+const HTF_MIN_BARS=60; // candle HTF minimal biar EMA21/ADX14 hasil resample stabil
+function htfExtraBars(baseInterval){
+  const htf=HTF_MAP[baseInterval];
+  if(!htf || htf===baseInterval) return 100;
+  const ratio=Math.round(BASE_MINUTES[htf]/BASE_MINUTES[baseInterval]);
+  return Math.max(100, ratio*HTF_MIN_BARS);
+}
+function computeHTFBias(baseCandles, baseInterval){
+  const htf=HTF_MAP[baseInterval];
+  if(!htf || htf===baseInterval) return null; // sudah timeframe paling besar
+  const resampled=resampleCandles(baseCandles, BASE_MINUTES[htf]);
+  if(resampled.length<30) throw new Error('Data candle belum cukup untuk resample HTF.');
+  const closes=resampled.map(c=>c.close);
   const e9=ema(closes,9), e21=ema(closes,21);
   const n=closes.length-1;
   const diff=e9[n]-e21[n];
-  const adxV=adxValue(candles.map(c=>c.high), candles.map(c=>c.low), closes);
+  const adxV=adxValue(resampled.map(c=>c.high), resampled.map(c=>c.low), closes);
   return { interval:htf, direction: diff>0?'BUY':diff<0?'SELL':'NETRAL', adx:adxV };
 }
 function applyMTF(sig, htf){
@@ -1423,23 +1440,20 @@ async function scan(){
 
   btn.disabled=true; btn.textContent='Scanning...';
   try{
-    // candle utama + bias HTF dijalankan BARENGAN (bukan HTF nyusul setelah
-    // sinyal utama selesai) -> keduanya dari siklus fetch yang sama, hasil
-    // konfirmasi multi-timeframe lebih sinkron & scan jadi lebih cepat.
-    const [candlesRes, htfRes]=await Promise.allSettled([
-      fetchCandles(symbol, interval, { signal:myCtrl.signal }),
-      fetchHTFBias(symbol, interval, { signal:myCtrl.signal })
-    ]);
+    // 1 fetch candle base-interval saja (minBars disesuaikan lewat htfExtraBars()
+    // supaya cukup buat di-resample jadi HTF juga) -> bias HTF TIDAK lagi minta
+    // network call kedua, cuma turunan lokal dari data yang sama.
+    const rawCandles=await fetchCandles(symbol, interval, { signal:myCtrl.signal, minBars:htfExtraBars(interval) });
     if(myCtrl.signal.aborted) return; // sudah digantikan scan yang lebih baru -> jangan render hasil basi
-    if(candlesRes.status==='rejected') throw candlesRes.reason;
-    const candles=candlesRes.value;
+    const candles=rawCandles.slice(-100); // sinyal utama tetap pakai 100 bar terakhir, sama seperti sebelumnya
     const sig=buildSignal(candles, symbol);
     const trendAdx=adxValue(candles.map(c=>c.high), candles.map(c=>c.low), candles.map(c=>c.close));
 
-    if(htfRes.status==='fulfilled'){
-      applyMTF(sig, htfRes.value);
-      renderMTF(htfRes.value, sig);
-    } else {
+    try{
+      const htf=computeHTFBias(rawCandles, interval);
+      if(htf){ applyMTF(sig, htf); renderMTF(htf, sig); }
+      else { document.getElementById('mtfArea').innerHTML='<div class="empty">Timeframe ini sudah paling besar, tidak ada HTF filter.</div>'; }
+    }catch(htfErr){
       document.getElementById('mtfArea').innerHTML='<div class="empty">Gagal memuat data HTF untuk konfirmasi.</div>';
     }
 
