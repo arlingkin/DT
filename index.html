@@ -684,8 +684,10 @@ async function fetchPrevDay(symbol, dailyCandles=null){
   cleanupPivotCache(todayStr);
   const cacheKey = symbol + '_' + todayStr;
   if(pivotCache.has(cacheKey)) return pivotCache.get(cacheKey);
-  // Kalau candle harian sudah tersedia dari fetch utama scan() (interval='1day'),
-  // pakai itu langsung -- 0 API call tambahan, bukan minta ulang ke upstream.
+  // scan() selalu kirim dailyCandles (baik interval='1day' asli maupun hasil
+  // resample rawCandles ke harian) -> 0 API call tambahan di jalur normal.
+  // Fallback tdRequest di bawah cuma jaring pengaman kalau data resample-nya
+  // ternyata kurang dari 2 bucket (mis. simbol baru/data historis terbatas).
   if(dailyCandles && dailyCandles.length>=2){
     const c=dailyCandles[dailyCandles.length-2];
     const result={ high:c.high, low:c.low, close:c.close };
@@ -1314,6 +1316,14 @@ function htfExtraBars(baseInterval){
   const ratio=Math.round(BASE_MINUTES[htf]/BASE_MINUTES[baseInterval]);
   return Math.max(100, ratio*HTF_MIN_BARS);
 }
+/* Berapa bar base-interval diperlukan biar resample ke 1day (buat pivot, lihat
+   fetchPrevDay) selalu punya >=2 bucket harian, termasuk pas hari Senin pagi
+   (perlu tembus balik ke hari Jumat lewat weekend gap 2 hari). 3 hari kalender
+   cukup aman utk semua interval, jauh di bawah cap outputsize TD (5000). */
+function pivotBarsNeeded(baseInterval){
+  if(baseInterval==='1day') return 100;
+  return Math.ceil(3*1440/BASE_MINUTES[baseInterval]);
+}
 function computeHTFBias(baseCandles, baseInterval){
   const htf=HTF_MAP[baseInterval];
   if(!htf || htf===baseInterval) return null; // sudah timeframe paling besar
@@ -1440,10 +1450,12 @@ async function scan(){
 
   btn.disabled=true; btn.textContent='Scanning...';
   try{
-    // 1 fetch candle base-interval saja (minBars disesuaikan lewat htfExtraBars()
-    // supaya cukup buat di-resample jadi HTF juga) -> bias HTF TIDAK lagi minta
-    // network call kedua, cuma turunan lokal dari data yang sama.
-    const rawCandles=await fetchCandles(symbol, interval, { signal:myCtrl.signal, minBars:htfExtraBars(interval) });
+    // 1 fetch candle base-interval saja. minBars = max kebutuhan HTF resample &
+    // pivot resample (lihat htfExtraBars/pivotBarsNeeded) -> HTF bias & pivot
+    // harian TIDAK lagi masing-masing minta network call sendiri, cuma turunan
+    // lokal dari 1 data yang sama. Sukses = 1 refresh scan = 1 API call candle.
+    const minBars=Math.max(htfExtraBars(interval), pivotBarsNeeded(interval));
+    const rawCandles=await fetchCandles(symbol, interval, { signal:myCtrl.signal, minBars });
     if(myCtrl.signal.aborted) return; // sudah digantikan scan yang lebih baru -> jangan render hasil basi
     const candles=rawCandles.slice(-100); // sinyal utama tetap pakai 100 bar terakhir, sama seperti sebelumnya
     const sig=buildSignal(candles, symbol);
@@ -1469,8 +1481,11 @@ async function scan(){
     document.getElementById('pivotArea').innerHTML=`
       <div class="cell"><div class="k">Trend (ADX14)</div><div class="v" style="font-size:15px;">${trendAdx.toFixed(1)}</div><div class="meta" style="margin-top:2px;">${trendLabel(trendAdx)}</div></div>`;
     try{
-      // interval='1day' -> candles utama sudah daily, langsung reuse (0 API call tambahan)
-      const prevDay=await fetchPrevDay(symbol, interval==='1day' ? candles : null);
+      // interval='1day' -> candles utama sudah daily. Interval lain -> resample
+      // rawCandles (sudah cukup panjang krn pivotBarsNeeded) jadi harian secara
+      // lokal. Kedua kasus: 0 API call tambahan buat pivot.
+      const dailyCandles = interval==='1day' ? candles : resampleCandles(rawCandles, 1440);
+      const prevDay=await fetchPrevDay(symbol, dailyCandles);
       const piv=calcPivots(prevDay, symbol);
       const chgPct=(((sig.entry-(+prevDay.close))/(+prevDay.close))*100).toFixed(2);
       document.getElementById('pivotArea').innerHTML+=`
