@@ -497,31 +497,57 @@ footer a{color:var(--primary);}
    timeout -> koneksi lambat/hang bikin tombol "Scanning..." macet selamanya.
    Sekarang: timeout keras per request + 1x retry untuk error transient
    (network/timeout/5xx), TIDAK retry untuk 4xx (kunci salah dsb, percuma diulang). */
-async function fetchWithTimeout(url, { timeoutMs=12000, signal }={}){
+async function rawFetch(url, { timeoutMs=12000, signal }={}){
   const ac=new AbortController();
   const onAbort=()=>ac.abort();
   if(signal){ if(signal.aborted) ac.abort(); else signal.addEventListener('abort', onAbort); }
   const timer=setTimeout(()=>ac.abort(), timeoutMs);
   try{
-    const res=await fetch(url, { signal:ac.signal });
-    if(!res.ok) throw new Error(`HTTP ${res.status}`);
-    return res;
+    return await fetch(url, { signal:ac.signal });
   } finally {
     clearTimeout(timer);
     if(signal) signal.removeEventListener('abort', onAbort);
   }
 }
+async function fetchWithTimeout(url, opts={}){
+  const res=await rawFetch(url, opts);
+  if(!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res;
+}
+/* Pesan error provider (401/402/403/429/5xx) dulu gampang muncul mentah sbg
+   "HTTP 402" dsb di panel (candle/COT/news/fundamental) karena requestJSON
+   throw duluan pas !res.ok, SEBELUM sempat baca body JSON error dari proxy.js
+   (proxy.js sebenarnya tetap forward body asli dari TD/Finnhub apa adanya).
+   Sekarang body selalu dicoba dibaca dulu, message dari situ dipakai; kalau
+   bodinya bukan JSON valid baru fallback ke pesan generik per kode status. */
+function friendlyHttpMessage(status){
+  if(status===402) return 'Kuota/API credit provider ini sudah habis (butuh upgrade plan atau tunggu reset kuota).';
+  if(status===401) return 'API key ditolak provider (tidak valid/kadaluarsa).';
+  if(status===403) return 'Endpoint ini butuh plan berbayar di provider tsb — akses ditolak.';
+  if(status===429) return 'Rate limit provider tercapai, coba lagi sebentar.';
+  if(status>=500) return 'Server upstream provider sedang bermasalah, coba lagi nanti.';
+  return `Gagal mengambil data dari provider (HTTP ${status}).`;
+}
 async function requestJSON(url, opts={}){
+  const attempt=async()=>{
+    const res=await rawFetch(url, opts);
+    let json=null;
+    try{ json=await res.json(); }catch(_){ /* body bukan JSON valid */ }
+    if(!res.ok){
+      const msg=(json && (json.message || json.error)) || friendlyHttpMessage(res.status);
+      throw Object.assign(new Error(msg), { httpStatus:res.status });
+    }
+    return json;
+  };
   try{
-    const res=await fetchWithTimeout(url, opts);
-    return await res.json();
+    return await attempt();
   }catch(e){
     if(e.name==='AbortError' && opts.signal && opts.signal.aborted) throw e; // dibatalkan sengaja (ganti pair) -> jangan retry
-    // retry sekali untuk timeout/network/5xx (bukan error 4xx dari kita sendiri)
-    if(!/^HTTP 4\d\d$/.test(e.message)){
+    // retry sekali cuma utk timeout/network/5xx -- 4xx (termasuk 401/402/403/429) pasti hasilnya sama lagi
+    const is4xx = e.httpStatus>=400 && e.httpStatus<500;
+    if(!is4xx){
       await new Promise(r=>setTimeout(r, 600));
-      const res=await fetchWithTimeout(url, opts);
-      return await res.json();
+      return await attempt();
     }
     throw e;
   }
@@ -1187,8 +1213,7 @@ async function fetchMarketauxNews(){
 }
 async function tdRequestGeneric(provider, endpoint, params){
   const qs=new URLSearchParams({provider, endpoint, ...params});
-  const res=await fetch(`/api/proxy?${qs.toString()}`);
-  return res.json();
+  return requestJSON(`/api/proxy?${qs.toString()}`);
 }
 async function fetchNews(){
   const results=await Promise.allSettled([fetchFinnhubNews(), fetchMarketauxNews()]);
@@ -1336,6 +1361,29 @@ function computeHTFBias(baseCandles, baseInterval){
   const adxV=adxValue(resampled.map(c=>c.high), resampled.map(c=>c.low), closes);
   return { interval:htf, direction: diff>0?'BUY':diff<0?'SELL':'NETRAL', adx:adxV };
 }
+
+/* ============ Cache candle client-side (in-memory, per tab) ============
+   1 hasil fetch candle (rawCandles) nyimpen SEMUA state yang dibutuhkan buat
+   render ulang dashboard (sinyal, chart, HTF, pivot) -- jadi ganti pair/TF
+   bisa langsung render instan dari cache kalau masih fresh, TANPA nunggu
+   network, dan TANPA nunggu siklus autoscan berikutnya. Key: symbol|interval,
+   sama seperti pivotCache/cotCache (Map biasa, hidup selama tab terbuka --
+   di reload/reopen app selalu ada 1x revalidate paksa lewat visitorAutoLoop()
+   pas boot, jadi tidak butuh persist lintas reload).
+   TTL disamakan dengan TD_CANDLE_TTL di proxy.js supaya cache client tidak
+   pernah "lebih optimis" dari cache server -- cuma menghemat 1 round-trip. */
+const CLIENT_CANDLE_TTL={'1min':90*1000,'5min':5*60*1000,'15min':10*60*1000,'1h':30*60*1000,'4h':60*60*1000,'1day':6*60*60*1000};
+const candleCache = new Map(); // key: `${symbol}|${interval}` -> { ts, rawCandles }
+function getCachedCandles(symbol, interval){
+  const c=candleCache.get(symbol+'|'+interval);
+  if(!c) return null;
+  const ttl=CLIENT_CANDLE_TTL[interval] || 60000;
+  if(Date.now()-c.ts >= ttl) return null; // basi -> perlakukan sbg cache miss
+  return c.rawCandles;
+}
+function setCachedCandles(symbol, interval, rawCandles){
+  candleCache.set(symbol+'|'+interval, { ts:Date.now(), rawCandles });
+}
 function applyMTF(sig, htf){
   if(!htf || sig.direction==='HOLD') return;
   if(sig.direction===htf.direction && htf.adx>=20){
@@ -1434,7 +1482,8 @@ renderRisk();
    di-abort (request in-flight dibatalkan lewat AbortController), scan baru langsung jalan. */
 let isScanning=false;
 let scanAbortCtrl=null;
-async function scan(){
+async function scan(opts={}){
+  const forceRevalidate = !!opts.forceRevalidate;
   if(riskLocked){ document.getElementById('errBox').textContent='Batas rugi harian tercapai — kunci otomatis aktif.'; return; }
   if(scanAbortCtrl) scanAbortCtrl.abort(); // batalkan scan sebelumnya kalau masih jalan
   const myCtrl=new AbortController();
@@ -1454,9 +1503,16 @@ async function scan(){
     // pivot resample (lihat htfExtraBars/pivotBarsNeeded) -> HTF bias & pivot
     // harian TIDAK lagi masing-masing minta network call sendiri, cuma turunan
     // lokal dari 1 data yang sama. Sukses = 1 refresh scan = 1 API call candle.
+    // Ganti pair/TF (forceRevalidate=false) pakai cache dulu kalau masih fresh
+    // -> instan, 0 API call. Autoscan & tombol "Scan Sinyal" (forceRevalidate=
+    // true) selalu tembus upstream biar data tetap ke-revalidate rutin.
     const minBars=Math.max(htfExtraBars(interval), pivotBarsNeeded(interval));
-    const rawCandles=await fetchCandles(symbol, interval, { signal:myCtrl.signal, minBars });
-    if(myCtrl.signal.aborted) return; // sudah digantikan scan yang lebih baru -> jangan render hasil basi
+    let rawCandles = forceRevalidate ? null : getCachedCandles(symbol, interval);
+    if(!rawCandles){
+      rawCandles=await fetchCandles(symbol, interval, { signal:myCtrl.signal, minBars });
+      if(myCtrl.signal.aborted) return; // sudah digantikan scan yang lebih baru -> jangan render hasil basi
+      setCachedCandles(symbol, interval, rawCandles);
+    }
     const candles=rawCandles.slice(-100); // sinyal utama tetap pakai 100 bar terakhir, sama seperti sebelumnya
     const sig=buildSignal(candles, symbol);
     const trendAdx=adxValue(candles.map(c=>c.high), candles.map(c=>c.low), candles.map(c=>c.close));
@@ -1548,8 +1604,8 @@ if(chartWrapElForObserver) chartWrapObserver.observe(chartWrapElForObserver);
 window.addEventListener('orientationchange', scheduleRedraw);
 window.addEventListener('resize', scheduleRedraw);
 
-document.getElementById('scanBtn').addEventListener('click', scan);
-document.getElementById('symbol').addEventListener('change', scan);
+document.getElementById('symbol').addEventListener('change', ()=>scan()); // ganti pair -> cache dulu kalau fresh, instan
+document.getElementById('scanBtn').addEventListener('click', ()=>scan({forceRevalidate:true})); // tombol manual -> selalu revalidate
 
 document.getElementById('copyBtn').addEventListener('click', ()=>{
   if(!lastSignal) return;
@@ -1756,16 +1812,17 @@ async function visitorAutoLoop(){
   // tanpa try/catch di sini bikin baris setTimeout di bawah TIDAK PERNAH jalan
   // -> loop auto-scan berhenti total dan permanen sampai user reload manual.
   try{
-    if(!document.hidden) await scan();
+    if(!document.hidden) await scan({forceRevalidate:true}); // autoscan selalu revalidate, bukan pakai cache
   }catch(loopErr){
     console.error('[visitorAutoLoop] scan() gagal, loop tetap dijadwalkan ke siklus berikutnya:', loopErr);
   }
   visitorAutoCount++;
   visitorAutoTimer=setTimeout(visitorAutoLoop, currentAutoscanMs());
 }
-// ganti timeframe -> auto-scan langsung ikut interval baru (tanpa nunggu siklus lama habis)
+// ganti timeframe -> langsung scan (cache dulu kalau fresh, instan) & auto-scan ikut interval baru
 document.getElementById('interval').addEventListener('change', ()=>{
   clearTimeout(visitorAutoTimer);
+  scan();
   visitorAutoTimer=setTimeout(visitorAutoLoop, currentAutoscanMs());
 });
 
