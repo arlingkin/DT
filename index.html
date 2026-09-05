@@ -1188,7 +1188,7 @@ function escapeHtml(str){
 async function fetchFinnhubNews(){
   const json=await fhRequest('news', { category:'forex' });
   if(!Array.isArray(json)) throw new Error('Finnhub: gagal memuat news.');
-  return json.slice(0,35).map(n=>({
+  return json.slice(0,60).map(n=>({
     headline:n.headline, url:n.url, source:n.source,
     ts:n.datetime*1000
   }));
@@ -1199,10 +1199,12 @@ async function fetchMarketauxNews(){
   // jadi tidak wajib untuk situs tetap jalan.
   // published_after + sort wajib di-set -> tanpa ini Marketaux balikin hasil dari
   // seluruh arsip historisnya (bisa 2022/2024) yang cuma cocok keyword, bukan berita baru.
+  // Window disamakan dgn MAX_AGE_MS (6 hari) di fetchNews() -- kalau di sini lebih
+  // pendek, berita 4-6 hari lalu gak pernah kebawa walau MAX_AGE_MS ngizinin.
   const bucketMs=15*60*1000; // dibucket biar cache key stabil, bukan berubah tiap request
-  const publishedAfter=new Date(Math.floor((Date.now()-3*24*60*60*1000)/bucketMs)*bucketMs).toISOString().slice(0,19);
+  const publishedAfter=new Date(Math.floor((Date.now()-6*24*60*60*1000)/bucketMs)*bucketMs).toISOString().slice(0,19);
   const json=await tdRequestGeneric('mx', 'news/all', {
-    search:'forex OR dollar OR "interest rate" OR gold OR fed', language:'en', limit:30,
+    search:'forex OR dollar OR "interest rate" OR gold OR fed', language:'en', limit:50,
     published_after:publishedAfter, sort:'published_desc'
   });
   if(!json || !Array.isArray(json.data)) throw new Error('Marketaux: tidak tersedia.');
@@ -1219,7 +1221,7 @@ async function fetchNews(){
   const results=await Promise.allSettled([fetchFinnhubNews(), fetchMarketauxNews()]);
   const combined=[];
   const seen=new Set();
-  const MAX_AGE_MS=5*24*60*60*1000; // buang berita >5 hari -> anti data basi (2022/2024) dari sumber manapun
+  const MAX_AGE_MS=6*24*60*60*1000; // rentang berita: hari ini s.d. 6 hari ke belakang
   const cutoff=Date.now()-MAX_AGE_MS;
   for(const r of results){
     if(r.status!=='fulfilled') continue;
@@ -1236,15 +1238,15 @@ async function fetchNews(){
     throw new Error('Gagal memuat news dari semua sumber. Cek API key.');
   }
   combined.sort((a,b)=>b.ts-a.ts);
-  return combined.slice(0,35);
+  return combined.slice(0,50); // pool cukup besar di atas target minimal 15 di panel
 }
 function renderNews(items){
   const area=document.getElementById('newsArea');
   if(!items.length){ area.innerHTML='<div class="empty">Tidak ada berita ditemukan.</div>'; return; }
-  // tampilkan full list (sampai 35) supaya panel selalu terisi penuh,
+  // tampilkan full list (sampai 50) supaya panel selalu terisi penuh,
   // bukan cuma yang tag-nya "prioritas" (fed/data/komoditas/geo) seperti sebelumnya.
   area.innerHTML=`<div class="meta" style="margin-bottom:8px;">${items.length} berita · diperbarui ${new Date().toLocaleTimeString('id-ID')} · sumber: ${[...new Set(items.map(n=>n.source))].map(escapeHtml).slice(0,4).join(', ')}</div>` +
-    items.slice(0,35).map(n=>{
+    items.slice(0,50).map(n=>{
       const safeUrl=/^https?:\/\//i.test(n.url||'')?n.url:'#';
       return `
     <div class="news-item">
